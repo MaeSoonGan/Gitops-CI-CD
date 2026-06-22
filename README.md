@@ -1,391 +1,640 @@
-# 🚀 MaeSoonGan Deployment
+# 배포 운영 및 트러블슈팅 가이드
 
-## ✍️ 프로젝트 한 줄 소개
+## 1. 개요
 
-MaeSoonGan 백엔드 서비스를 안정적으로 빌드·배포·운영하기 위한 AWS EKS 기반 컨테이너 배포 환경과 CI/CD 파이프라인입니다.
+이 문서는 MaeSoonGan 배포 과정에서 발생할 수 있는 문제를 단계별로 확인하기 위한 가이드입니다.
 
----
-
-## 🛫 레포지토리 개요
-
-이 레포지토리는 MaeSoonGan 백엔드 서비스의 배포에 필요한 설정과 문서를 관리합니다.
-
-개발자가 GitHub에 코드를 Push하면 GitHub Actions가 각 Spring Boot 서비스를 빌드하고 Docker 이미지를 생성합니다. 생성된 이미지는 Amazon ECR에 저장되며, Kubernetes Manifest를 통해 Amazon EKS에 배포됩니다.
-
-현재는 GitHub Actions 기반 이미지 빌드와 ECR Push, Kubernetes Manifest 작성, EKS 연결까지 구성되어 있습니다. 향후 Argo CD와 Argo Rollouts를 연동하여 GitOps 기반 자동 배포와 무중단 배포 환경으로 확장할 예정입니다.
-
----
-
-## 🎯 배포 목표
-
-- 코드 Push부터 Docker 이미지 생성까지 자동화
-- 서비스별 독립 빌드 및 배포
-- Commit SHA 기반 이미지 버전 추적
-- GitHub OIDC 기반 AWS 인증
-- Kubernetes를 통한 실행 상태 관리
-- 향후 Argo CD 기반 GitOps 자동 배포
-- Argo Rollouts 기반 Canary 또는 Blue-Green 배포
-- ALB, ACM, Route 53을 통한 외부 서비스 연결
-
----
-
-## 🖥️ 배포 환경 및 서버 사양
-
-| 구분 | 구성 |
-|---|---|
-| Cloud Provider | AWS |
-| Container Registry | Amazon ECR |
-| Container Orchestration | Amazon EKS |
-| CI | GitHub Actions |
-| CD | Kubernetes 수동 적용, Argo CD 예정 |
-| Application | Spring Boot 3 |
-| Build Tool | Gradle |
-| Runtime | Java 17 |
-| Container | Docker |
-| Kubernetes Namespace | `app` |
-| AWS Region | `ap-northeast-2` |
-| Image Tag | `latest`, GitHub Commit SHA |
-
-서버와 Node Group의 세부 사양은 실제 EKS 구성에 맞춰 별도 문서에 기록합니다.
-
----
-
-## 🧩 구성 요소
-
-### GitHub Actions
-
-- Repository 코드 Checkout
-- GitHub OIDC 기반 AWS 인증
-- 서비스별 Docker 이미지 빌드
-- Commit SHA 및 `latest` 태그 생성
-- Amazon ECR 이미지 Push
-
-### Amazon ECR
-
-- 서비스별 Docker 이미지 저장
-- 이미지 태그 및 배포 버전 관리
-- EKS에서 사용할 이미지 제공
-
-### Kubernetes
-
-- Deployment와 Service 정의
-- ConfigMap과 Secret 주입
-- Readiness/Liveness Probe 설정
-- NodeSelector 기반 Pod 배치
-- Kustomize 기반 Manifest 관리
-
-### Amazon EKS
-
-- MaeSoonGan 백엔드 Pod 실행
-- Replica 및 상태 관리
-- Service 기반 내부 통신
-- 향후 Ingress와 ALB 연결
-
-### Argo CD 및 Argo Rollouts
-
-- Git Repository와 EKS 상태 동기화
-- Manifest 변경 자동 반영
-- Canary 또는 Blue-Green 배포
-- 배포 상태 및 Rollback 관리
-
----
-
-## 🏗️ 전체 배포 아키텍처
-
-```text
-┌──────────────────────────────┐
-│          Developer           │
-│                              │
-│     Code Commit & Push       │
-└──────────────┬───────────────┘
-               │
-               ▼
-┌──────────────────────────────┐
-│           GitHub             │
-│                              │
-│      develop / main          │
-└──────────────┬───────────────┘
-               │
-               ▼
-┌──────────────────────────────┐
-│       GitHub Actions         │
-│                              │
-│  OIDC Authentication         │
-│  Gradle / Docker Build       │
-│  Image Tagging               │
-└──────────────┬───────────────┘
-               │
-               ▼
-┌──────────────────────────────┐
-│        Amazon ECR            │
-│                              │
-│  Service Docker Images       │
-│  latest / Commit SHA         │
-└──────────────┬───────────────┘
-               │
-               ▼
-┌──────────────────────────────┐
-│        Amazon EKS            │
-│                              │
-│  Deployment / Service        │
-│  ConfigMap / Secret          │
-└──────────────┬───────────────┘
-               │
-               ▼
-┌──────────────────────────────┐
-│      MaeSoonGan Services     │
-│                              │
-│  admin / auth / contest      │
-│  market / order              │
-└──────────────────────────────┘
-```
-
-향후 구조는 다음과 같이 확장합니다.
+장애를 분석할 때는 다음 순서로 범위를 좁힙니다.
 
 ```text
 GitHub Actions
+    ↓
+AWS OIDC / IAM
     ↓
 Amazon ECR
     ↓
-Manifest Repository
+EKS API 접근
     ↓
-Argo CD
+Kubernetes Scheduling
     ↓
-Argo Rollouts
+Container 실행
     ↓
-Amazon EKS
+Service / Endpoint
     ↓
-ALB Ingress
-    ↓
-Route 53 / Client
+애플리케이션 외부 연동
 ```
 
 ---
 
-## 🔁 CI/CD 및 배포 흐름
+## 2. 기본 점검 순서
+
+### 2.1 GitHub Actions 성공 여부
 
 ```text
-개발자 코드 Push
-    ↓
-GitHub Actions
-    ↓
-Gradle bootJar
-    ↓
-Docker Image Build
-    ↓
-AWS ECR Push
-    ↓
-Kubernetes Manifest 적용
-    ↓
-AWS EKS 배포
-    ↓
-Service / Ingress를 통한 요청 전달
+Checkout
+Configure AWS credentials
+Login to ECR
+Docker Build
+Docker Push
 ```
 
-현재 GitHub Actions는 Docker 이미지 생성과 ECR Push까지 담당합니다.
+### 2.2 ECR 이미지 존재 여부
 
-Kubernetes Manifest는 `kubectl apply -k`로 적용하며, 향후 Argo CD가 Git 변경사항을 감지하여 EKS 상태를 자동으로 동기화하도록 변경할 예정입니다.
-
----
-
-## 📦 서비스별 배포 대상
-
-| 서비스 | 역할 | ECR Repository |
-|---|---|---|
-| `admin-service` | 관리자 기능 | `maesoongan/admin-service` |
-| `auth-service` | 사용자 인증 및 인가 | `maesoongan/auth-service` |
-| `contest-service` | 대회 및 참가 관리 | `maesoongan/contest-service` |
-| `market-service` | 시장 데이터 관리 | `maesoongan/market-service` |
-| `order-service` | 주문 처리 | `maesoongan/order-service` |
-
-서비스별 Dockerfile은 다음 위치에서 관리합니다.
-
-```text
-apps/api/admin-service/Dockerfile
-apps/api/auth-service/Dockerfile
-apps/api/contest-service/Dockerfile
-apps/api/market-service/Dockerfile
-apps/api/order-service/Dockerfile
+```bash
+aws ecr describe-images \
+  --repository-name maesoongan/auth-service \
+  --region ap-northeast-2
 ```
 
----
+### 2.3 EKS 접근 여부
 
-## 🌐 네트워크 및 접근 구조
-
-### Kubernetes 내부 통신
-
-각 서비스는 Pod IP가 아니라 Kubernetes Service 이름을 통해 통신합니다.
-
-```text
-다른 서비스
-    ↓
-Kubernetes Service
-    ↓
-Ready 상태의 Pod
+```bash
+kubectl get nodes
 ```
 
-같은 Namespace에서는 다음 형식으로 접근합니다.
+### 2.4 Pod 상태
 
-```text
-http://{service-name}:{port}
+```bash
+kubectl get pods \
+  -n app \
+  -o wide
 ```
 
-### EKS API 접근
+### 2.5 Pod 이벤트
 
-현재 EKS API Endpoint는 Private Access 중심으로 구성되어 있습니다.
-
-```text
-publicAccess: false
-privateAccess: true
+```bash
+kubectl describe pod \
+  -n app \
+  {pod-name}
 ```
 
-따라서 다음 방식 중 하나로 접근해야 합니다.
+### 2.6 애플리케이션 로그
 
-- 같은 VPC의 Bastion EC2
-- VPN 연결 환경
-- VPC 내부 관리 서버
-- 제한된 IP만 허용한 Public Endpoint 임시 활성화
-
-### 외부 트래픽
-
-향후 다음 구조를 구성합니다.
-
-```text
-Client
-    ↓
-Route 53
-    ↓
-AWS ALB
-    ↓
-Ingress
-    ↓
-Kubernetes Service
-    ↓
-Application Pod
+```bash
+kubectl logs \
+  -n app \
+  {pod-name}
 ```
 
 ---
 
-## 🔐 인증 및 보안 구성
+## 3. GitHub Actions 문제
 
-### GitHub OIDC
+### 3.1 `Incorrect token audience`
 
-GitHub Actions는 AWS Access Key를 장기 저장하지 않고 OIDC를 통해 IAM Role을 Assume합니다.
-
-```text
-GitHub Actions
-    ↓
-OIDC Token
-    ↓
-AWS STS
-    ↓
-IAM Trust Policy 검증
-    ↓
-임시 자격증명
-    ↓
-Amazon ECR 접근
-```
-
-### 접근 제한
-
-IAM Trust Policy에서 다음 항목을 제한합니다.
-
-- GitHub Owner
-- Repository
-- Branch
-- OIDC Audience
-
-허용 Branch:
+증상:
 
 ```text
-develop
-main
+Could not assume role with OIDC: Incorrect token audience
 ```
 
-OIDC Audience:
+원인:
+
+- OIDC Provider Audience 오류
+- Trust Policy의 `aud` 오류
+
+해결:
 
 ```text
 sts.amazonaws.com
 ```
 
-### Secret 관리
+### 3.2 `Not authorized to perform sts:AssumeRoleWithWebIdentity`
 
-민감정보는 Repository에 직접 저장하지 않습니다.
+원인 후보:
 
-```text
-DB Password
-JWT Secret
-Redis Password
-외부 API Key
-```
+- Owner 불일치
+- Repository 이름 불일치
+- Branch 불일치
+- Role ARN 오류
+- OIDC Provider ARN 오류
+- `id-token: write` 누락
 
-실제 값은 Kubernetes Secret 또는 향후 AWS Secrets Manager를 통해 관리합니다.
-
----
-
-## 📂 디렉터리 구조
+확인 예시:
 
 ```text
-.
-├── README.md
-│
-├── .github
-│   └── workflows
-│       └── build-and-push-ecr.yml
-│
-├── apps
-│   └── api
-│       ├── admin-service
-│       │   └── Dockerfile
-│       ├── auth-service
-│       │   └── Dockerfile
-│       ├── contest-service
-│       │   └── Dockerfile
-│       ├── market-service
-│       │   └── Dockerfile
-│       └── order-service
-│           └── Dockerfile
-│
-├── infra
-│   └── k8s
-│       └── api
-│           ├── namespace.yaml
-│           ├── configmap.yaml
-│           ├── secret.example.yaml
-│           ├── admin-service.yaml
-│           ├── auth-service.yaml
-│           ├── contest-service.yaml
-│           ├── market-service.yaml
-│           ├── order-service.yaml
-│           └── kustomization.yaml
-│
-└── docs
-    └── deployment
-        ├── 01-GitHub-Actions-CI.md
-        ├── 02-Docker-Image.md
-        ├── 03-AWS-ECR.md
-        ├── 04-GitHub-OIDC-IAM.md
-        ├── 05-Kubernetes-Application.md
-        ├── 06-AWS-EKS-Deployment.md
-        ├── 07-Secret-Management.md
-        ├── 08-Troubleshooting.md
-        └── 09-ArgoCD-GitOps.md
+repo:MaeSoonGan/Back-End:ref:refs/heads/develop
+```
+
+### 3.3 ECR Push 권한 오류
+
+```text
+not authorized to perform: ecr:PutImage
+```
+
+확인 항목:
+
+- IAM Policy 연결
+- Repository ARN
+- Region
+- Account ID
+- `ecr:PutImage`
+- Layer Upload 권한
+
+---
+
+## 4. Docker Build 문제
+
+### 4.1 `gradlew exit code 126`
+
+원인:
+
+```text
+gradlew 실행 권한 없음
+```
+
+해결:
+
+```dockerfile
+RUN chmod +x gradlew
+```
+
+### 4.2 멀티 프로젝트 디렉터리 오류
+
+```text
+Configuring project ':apps:worker' without an existing directory is not allowed.
+```
+
+해결:
+
+```dockerfile
+COPY apps ./apps
+```
+
+### 4.3 JAR 복사 실패
+
+```text
+COPY failed: no source files were specified
+```
+
+확인 항목:
+
+- Gradle Task 성공
+- 서비스 경로
+- `build/libs`
+- JAR 파일명
+- `bootJar` 활성화 여부
+
+### 4.4 Docker Build Context 오류
+
+Repository Root에서 실행합니다.
+
+```bash
+docker build \
+  -f apps/api/auth-service/Dockerfile \
+  -t auth-service:local \
+  .
 ```
 
 ---
 
-## 📋 배포 문서 목차
+## 5. ECR 문제
 
-| 번호 | 문서 | 주요 내용 |
-|---:|---|---|
-| 01 | [GitHub Actions CI 파이프라인](./docs/deployment/01-GitHub-Actions-CI.md) | Gradle 빌드, Docker 이미지 생성, ECR Push |
-| 02 | [서비스별 Docker 이미지 구성](./docs/deployment/02-Docker-Image.md) | Dockerfile, Multi-stage Build, 서비스별 설정 |
-| 03 | [AWS ECR 이미지 저장소 구성](./docs/deployment/03-AWS-ECR.md) | Repository, 이미지 태그, 수명 주기 |
-| 04 | [GitHub OIDC 및 IAM 구성](./docs/deployment/04-GitHub-OIDC-IAM.md) | GitHub Actions와 AWS 인증 |
-| 05 | [Kubernetes 애플리케이션 배포](./docs/deployment/05-Kubernetes-Application.md) | Deployment, Service, ConfigMap, Secret |
-| 06 | [AWS EKS 클러스터 연결 및 배포](./docs/deployment/06-AWS-EKS-Deployment.md) | kubeconfig, Node, 실제 배포 |
-| 07 | [Secret 및 환경변수 관리](./docs/deployment/07-Secret-Management.md) | 환경변수와 민감정보 관리 |
-| 08 | [배포 운영 및 트러블슈팅](./docs/deployment/08-Troubleshooting.md) | 배포 오류 분석과 해결 |
-| 09 | [Argo CD 기반 GitOps](./docs/deployment/09-ArgoCD-GitOps.md) | 자동 배포와 Rollout 구성 |
+### 5.1 Repository가 없음
+
+```text
+repository does not exist
+```
+
+확인 항목:
+
+- `maesoongan/{service-name}`
+- AWS Region
+- AWS Account
+- 이름 오타
+
+### 5.2 인증정보 없음
+
+```text
+no basic auth credentials
+```
+
+해결:
+
+- ECR 로그인 확인
+- AWS 자격증명 확인
+- GitHub Actions OIDC Step 확인
+
+### 5.3 태그 없음
+
+Kubernetes Manifest가 참조하는 태그가 실제 ECR에 있는지 확인합니다.
+
+```bash
+aws ecr list-images \
+  --repository-name maesoongan/auth-service \
+  --region ap-northeast-2
+```
 
 ---
+
+## 6. EKS API 접근 문제
+
+### 6.1 `kubectl` Timeout
+
+원인 후보:
+
+- Private Endpoint만 활성화
+- VPN 미연결
+- VPC 외부 접근
+- Security Group
+- Route Table
+- DNS
+
+Cluster 설정 확인:
+
+```bash
+aws eks describe-cluster \
+  --region ap-northeast-2 \
+  --name maesoongan-cluster \
+  --query "cluster.resourcesVpcConfig"
+```
+
+### 6.2 `Unauthorized`
+
+원인 후보:
+
+- 다른 AWS Profile
+- EKS Kubernetes 권한 없음
+- Session 만료
+- kubeconfig Context 오류
+
+확인:
+
+```bash
+aws sts get-caller-identity
+kubectl config current-context
+```
+
+---
+
+## 7. Pod 상태별 문제
+
+### 7.1 `Pending`
+
+대표 원인:
+
+- NodeSelector 불일치
+- CPU/Memory 부족
+- Node `NotReady`
+- Taint와 Toleration
+- PVC 문제
+
+확인:
+
+```bash
+kubectl describe pod \
+  -n app \
+  {pod-name}
+```
+
+Node Label 확인:
+
+```bash
+kubectl get nodes --show-labels
+```
+
+필요한 Label:
+
+```bash
+kubectl label node \
+  {node-name} \
+  role=service
+```
+
+### 7.2 `ImagePullBackOff`
+
+대표 원인:
+
+- 이미지 경로 오류
+- 태그 없음
+- ECR Pull 권한 없음
+- 다른 Region 또는 Account
+- Repository 없음
+
+확인:
+
+```bash
+kubectl describe pod \
+  -n app \
+  {pod-name}
+```
+
+### 7.3 `CrashLoopBackOff`
+
+대표 원인:
+
+- Spring Boot 실행 실패
+- 환경변수 누락
+- DB 연결 실패
+- Redis 연결 실패
+- JWT Secret 누락
+- Port 충돌
+- 잘못된 Profile
+
+로그:
+
+```bash
+kubectl logs \
+  -n app \
+  {pod-name}
+```
+
+이전 컨테이너 로그:
+
+```bash
+kubectl logs \
+  -n app \
+  {pod-name} \
+  --previous
+```
+
+### 7.4 `CreateContainerConfigError`
+
+대표 원인:
+
+- Secret 없음
+- ConfigMap 없음
+- Key 불일치
+- Namespace 불일치
+
+확인:
+
+```bash
+kubectl get secret -n app
+kubectl get configmap -n app
+kubectl describe pod -n app {pod-name}
+```
+
+### 7.5 `OOMKilled`
+
+원인:
+
+```text
+컨테이너가 Memory Limit 초과
+```
+
+확인:
+
+```bash
+kubectl describe pod \
+  -n app \
+  {pod-name}
+```
+
+대응:
+
+- Memory Limit 조정
+- JVM Heap 설정 검토
+- Memory Leak 분석
+- 트래픽 및 Batch 처리량 확인
+
+---
+
+## 8. Probe 문제
+
+### 8.1 Readiness Probe 실패
+
+증상:
+
+- Pod는 `Running`
+- `READY 0/1`
+- Service Endpoint에서 제외
+
+확인 항목:
+
+- Actuator Endpoint
+- Port
+- Path
+- 초기 지연시간
+- 인증 적용 여부
+
+### 8.2 Liveness Probe 실패
+
+증상:
+
+- Pod가 반복 재시작
+- `RESTARTS` 증가
+
+확인 항목:
+
+- 애플리케이션 시작 시간
+- Probe Path
+- DB 장애를 Liveness에 포함했는지
+- `initialDelaySeconds`
+- Startup Probe 필요 여부
+
+---
+
+## 9. Service 및 Endpoint 문제
+
+### 9.1 Endpoint가 없음
+
+```bash
+kubectl get endpoints \
+  -n app
+```
+
+원인 후보:
+
+- Service Selector 불일치
+- Pod Label 불일치
+- Readiness 실패
+- 다른 Namespace
+
+### 9.2 Service 연결 실패
+
+확인 항목:
+
+- `port`
+- `targetPort`
+- `containerPort`
+- 애플리케이션 `server.port`
+
+### 9.3 DNS 확인
+
+```bash
+kubectl run dns-test \
+  --rm -it \
+  --restart=Never \
+  --image=busybox:1.36 \
+  -n app \
+  -- nslookup auth-service
+```
+
+### 9.4 HTTP 연결 확인
+
+```bash
+kubectl run curl-test \
+  --rm -it \
+  --restart=Never \
+  --image=curlimages/curl \
+  -n app \
+  -- curl -v http://auth-service:8081/actuator/health
+```
+
+---
+
+## 10. ConfigMap 및 Secret 문제
+
+### Secret Key 확인
+
+```bash
+kubectl describe secret \
+  api-secret \
+  -n app
+```
+
+### ConfigMap 확인
+
+```bash
+kubectl get configmap \
+  api-config \
+  -n app \
+  -o yaml
+```
+
+### 변경 반영
+
+```bash
+kubectl rollout restart \
+  deployment/auth-service \
+  -n app
+```
+
+---
+
+## 11. DB 연결 문제
+
+로그에서 다음 항목을 확인합니다.
+
+- Connection Refused
+- Authentication Failed
+- Unknown Host
+- Timeout
+- SSL 오류
+- Connection Pool 부족
+
+확인 항목:
+
+```text
+JDBC URL
+DB Host
+DB Port
+Database Name
+Username
+Password
+Security Group
+Route
+DNS
+```
+
+---
+
+## 12. Redis 연결 문제
+
+확인 항목:
+
+```text
+REDIS_HOST
+REDIS_PORT
+REDIS_PASSWORD
+TLS 사용 여부
+Security Group
+Redis Cluster Mode
+DNS
+```
+
+Pod 내부에서 연결을 점검할 때는 전용 진단 Pod를 사용하는 것이 좋습니다.
+
+---
+
+## 13. 배포 Rollout 문제
+
+상태 확인:
+
+```bash
+kubectl rollout status \
+  deployment/auth-service \
+  -n app
+```
+
+이력 확인:
+
+```bash
+kubectl rollout history \
+  deployment/auth-service \
+  -n app
+```
+
+롤백:
+
+```bash
+kubectl rollout undo \
+  deployment/auth-service \
+  -n app
+```
+
+---
+
+## 14. 이벤트 확인
+
+Namespace 이벤트:
+
+```bash
+kubectl get events \
+  -n app \
+  --sort-by=.metadata.creationTimestamp
+```
+
+Cluster 전체 이벤트:
+
+```bash
+kubectl get events \
+  -A \
+  --sort-by=.metadata.creationTimestamp
+```
+
+이벤트는 Image Pull, Scheduling, Probe, Mount 오류를 빠르게 확인하는 데 유용합니다.
+
+---
+
+## 15. 장애 대응 기록 양식
+
+```markdown
+## 장애 제목
+
+### 발생 시각
+
+### 영향 범위
+
+### 최초 증상
+
+### 확인한 로그 및 이벤트
+
+### 원인
+
+### 임시 조치
+
+### 근본 해결
+
+### 재발 방지
+
+### 관련 Commit / Image Tag
+```
+
+---
+
+## 16. 최종 체크리스트
+
+- [ ] GitHub Actions가 성공했는가
+- [ ] ECR에 해당 태그가 존재하는가
+- [ ] 현재 AWS Account가 정확한가
+- [ ] 현재 Kubernetes Context가 정확한가
+- [ ] Node가 `Ready`인가
+- [ ] NodeSelector와 Label이 일치하는가
+- [ ] Secret과 ConfigMap이 존재하는가
+- [ ] Pod Event에 오류가 없는가
+- [ ] 애플리케이션 로그가 정상인가
+- [ ] Readiness가 성공하는가
+- [ ] Service Endpoint가 생성됐는가
+- [ ] 서비스 간 DNS와 Port가 정상인가
